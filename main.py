@@ -4,22 +4,49 @@ import pickle
 import threading
 import time
 import contextlib
+import base64
+import json
+import shutil
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
 
 import mysql.connector
+
+# Keep third-party audio libraries quiet during device probing.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+SUPPRESS_AUDIO_BACKEND_NOISE = os.getenv("SUPPRESS_AUDIO_BACKEND_NOISE", "1") == "1"
+
+
+@contextlib.contextmanager
+def suppress_native_stderr(enabled=True):
+    if not enabled:
+        yield
+        return
+
+    try:
+        stderr_fd = sys.stderr.fileno()
+    except (AttributeError, ValueError, OSError):
+        yield
+        return
+
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as null_stream:
+            os.dup2(null_stream.fileno(), stderr_fd)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
 
 DELETE_MODE = len(sys.argv) >= 3 and sys.argv[1] == "remove-user"
 
 if not DELETE_MODE:
     import cv2
     import numpy as np
-    import speech_recognition as sr
-
-    try:
-        import pyttsx3
-    except ImportError:
-        print("❌ Missing dependency: pyttsx3")
-        print("Install it in your active environment and rerun.")
-        sys.exit(1)
+    with suppress_native_stderr(SUPPRESS_AUDIO_BACKEND_NOISE):
+        import speech_recognition as sr
 
     try:
         import face_recognition
@@ -64,12 +91,19 @@ ENROLLMENT_SAMPLES = int(os.getenv("ENROLLMENT_SAMPLES", "5"))
 MIN_BLUR_SCORE = float(os.getenv("MIN_BLUR_SCORE", "70"))
 FACE_DETECTION_MODEL = os.getenv("FACE_DETECTION_MODEL", "hog")
 DISTANT_FACE_RETRY = os.getenv("DISTANT_FACE_RETRY", "0") == "1"
-
-# ---------------- FIX AUDIO WARNINGS ----------------
-os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+RESEMBLE_API_KEY = os.getenv("RESEMBLE_API_KEY", "YH6kxUBP92DShaTugh8rqQtt").strip()
+RESEMBLE_VOICE_UUID = os.getenv("RESEMBLE_VOICE_UUID", "c99f388c").strip()
+RESEMBLE_PROJECT_UUID = os.getenv("RESEMBLE_PROJECT_UUID", "").strip()
+RESEMBLE_MODEL = os.getenv("RESEMBLE_MODEL", "").strip()
+RESEMBLE_SAMPLE_RATE = int(os.getenv("RESEMBLE_SAMPLE_RATE", "22050"))
+RESEMBLE_TIMEOUT = float(os.getenv("RESEMBLE_TIMEOUT", "20"))
+RESEMBLE_USE_HD = os.getenv("RESEMBLE_USE_HD", "0") == "1"
+RESEMBLE_VOICE_PROMPT = os.getenv("RESEMBLE_VOICE_PROMPT", "").strip()
+RESEMBLE_OUTPUT_FORMAT = os.getenv("RESEMBLE_OUTPUT_FORMAT", "wav").strip().lower()
 
 # ---------------- VOICE ----------------
-engine = None
+voice_ready = False
+audio_player = None
 tts_lock = threading.Lock()
 
 
@@ -80,24 +114,124 @@ def suppress_stderr():
             yield
 
 
-if ENABLE_VOICE:
+def audio_probe_context():
+    if not SUPPRESS_AUDIO_BACKEND_NOISE:
+        return contextlib.nullcontext()
+    stack = contextlib.ExitStack()
+    stack.enter_context(suppress_native_stderr(True))
+    stack.enter_context(suppress_stderr())
+    return stack
+
+
+def wrap_with_prompt(text):
+    if not RESEMBLE_VOICE_PROMPT:
+        return text
+    return f'<speak prompt="{RESEMBLE_VOICE_PROMPT}">{text}</speak>'
+
+
+def get_audio_player():
+    for candidate in ("paplay", "aplay"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def play_audio_file(audio_path):
+    if audio_player is None:
+        raise RuntimeError("No audio playback tool found. Install paplay or aplay.")
+
+    command = [audio_player, audio_path]
+    if os.path.basename(audio_player) == "aplay":
+        command = [audio_player, "-q", audio_path]
+
+    with suppress_stderr():
+        subprocess.run(command, check=True)
+
+
+def synthesize_with_resemble(text):
+    payload = {
+        "voice_uuid": RESEMBLE_VOICE_UUID,
+        "data": wrap_with_prompt(text),
+        "sample_rate": RESEMBLE_SAMPLE_RATE,
+        "output_format": RESEMBLE_OUTPUT_FORMAT,
+    }
+    if RESEMBLE_PROJECT_UUID:
+        payload["project_uuid"] = RESEMBLE_PROJECT_UUID
+    if RESEMBLE_MODEL:
+        payload["model"] = RESEMBLE_MODEL
+    if RESEMBLE_USE_HD:
+        payload["use_hd"] = True
+
+    request = urllib.request.Request(
+        "https://f.cluster.resemble.ai/synthesize",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {RESEMBLE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
     try:
-        with suppress_stderr():
-            engine = pyttsx3.init('espeak')
-        engine.setProperty('rate', 150)
-    except Exception as e:
-        print(f"⚠️ Voice engine unavailable: {e}")
+        with urllib.request.urlopen(request, timeout=RESEMBLE_TIMEOUT) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Resemble API error {exc.code}: {details}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach Resemble API: {exc.reason}") from exc
+
+    audio_content = result.get("audio_content")
+    if not result.get("success") or not audio_content:
+        raise RuntimeError(f"Resemble synthesis failed: {result.get('issues') or result}")
+
+    return base64.b64decode(audio_content)
+
+
+def init_voice():
+    global voice_ready, audio_player
+    if not ENABLE_VOICE:
+        return
+
+    missing_values = []
+    if not RESEMBLE_API_KEY:
+        missing_values.append("RESEMBLE_API_KEY")
+    if not RESEMBLE_VOICE_UUID:
+        missing_values.append("RESEMBLE_VOICE_UUID")
+
+    if missing_values:
+        print(f"⚠️ Voice disabled: missing {', '.join(missing_values)} for Resemble AI.")
+        return
+
+    audio_player = get_audio_player()
+    if audio_player is None:
+        print("⚠️ Voice disabled: install paplay or aplay to play Resemble audio.")
+        return
+
+    voice_ready = True
+    print(f"✅ Resemble AI voice enabled with player: {os.path.basename(audio_player)}")
+
+
+init_voice()
 
 def speak(text):
     print("Robot:", text)
-    if engine is None or not ENABLE_VOICE:
+    if not voice_ready or not ENABLE_VOICE:
         return
     try:
-        # pyttsx3 is not thread-safe; serialize all TTS calls.
+        # Playback is serialized so the robot doesn't overlap its own speech.
         with tts_lock:
-            with suppress_stderr():
-                engine.say(text)
-                engine.runAndWait()
+            audio_bytes = synthesize_with_resemble(text)
+            suffix = ".mp3" if RESEMBLE_OUTPUT_FORMAT == "mp3" else ".wav"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as audio_file:
+                audio_file.write(audio_bytes)
+                temp_audio_path = audio_file.name
+            try:
+                play_audio_file(temp_audio_path)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(temp_audio_path)
     except Exception as e:
         print(f"⚠️ Voice playback failed: {e}")
 
@@ -229,7 +363,8 @@ if DELETE_MODE:
 
 def resolve_microphone_index():
     try:
-        mic_names = sr.Microphone.list_microphone_names()
+        with audio_probe_context():
+            mic_names = sr.Microphone.list_microphone_names()
     except Exception as e:
         print(f"⚠️ Could not list microphones: {e}")
         return MIC_INDEX
@@ -270,20 +405,21 @@ def get_name():
             speak("Tell me your name")
             time.sleep(POST_TTS_PAUSE)
 
-            with sr.Microphone(
-                device_index=ACTIVE_MIC_INDEX,
-                chunk_size=MIC_CHUNK_SIZE,
-            ) as source:
-                # Give the recognizer a bit more time to adapt to the room.
-                r.adjust_for_ambient_noise(source, duration=MIC_AMBIENT_DURATION)
-                r.energy_threshold = max(r.energy_threshold * 0.85, MIC_MIN_ENERGY)
-                print(f"Listening with energy threshold: {r.energy_threshold:.1f}")
+            with audio_probe_context():
+                with sr.Microphone(
+                    device_index=ACTIVE_MIC_INDEX,
+                    chunk_size=MIC_CHUNK_SIZE,
+                ) as source:
+                    # Give the recognizer a bit more time to adapt to the room.
+                    r.adjust_for_ambient_noise(source, duration=MIC_AMBIENT_DURATION)
+                    r.energy_threshold = max(r.energy_threshold * 0.85, MIC_MIN_ENERGY)
+                    print(f"Listening with energy threshold: {r.energy_threshold:.1f}")
 
-                audio = r.listen(
-                    source,
-                    timeout=NAME_TIMEOUT,
-                    phrase_time_limit=NAME_PHRASE_TIME_LIMIT,
-                )
+                    audio = r.listen(
+                        source,
+                        timeout=NAME_TIMEOUT,
+                        phrase_time_limit=NAME_PHRASE_TIME_LIMIT,
+                    )
 
             heard_text = None
             recognition_languages = [SPEECH_LANGUAGE]
