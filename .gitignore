@@ -1,1 +1,8 @@
-robot_env311/
+.venv/
+.env
+.codex
+__pycache__/
+*.pyc
+*.wav
+data/faces/
+data/piper/

@@ -1,0 +1,9 @@
+mysql-connector-python
+opencv-python
+numpy
+face_recognition
+SpeechRecognition
+PyAudio
+setuptools<81
+vosk
+python-dotenv
