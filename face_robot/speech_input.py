@@ -19,6 +19,29 @@ _SR_PAUSE_THRESHOLD = 1.2
 _SR_NON_SPEAKING_DURATION = 0.6
 
 
+def _input_capable_indices():
+    """Device indices that actually accept audio input (excludes many HDMI ports)."""
+    import pyaudio
+
+    pa = pyaudio.PyAudio()
+    try:
+        return {
+            i
+            for i in range(pa.get_device_count())
+            if int(pa.get_device_info_by_index(i).get("maxInputChannels", 0)) >= 1
+        }
+    finally:
+        pa.terminate()
+
+
+def _looks_like_bad_capture(name: str | None) -> bool:
+    """Heuristic: HDMI outputs are rarely valid microphones."""
+    if not name:
+        return False
+    n = name.lower()
+    return "hdmi" in n and "mic" not in n
+
+
 def resolve_microphone_index():
     try:
         with audio_probe_context():
@@ -27,27 +50,62 @@ def resolve_microphone_index():
         print(f"⚠️ Could not list microphones: {e}")
         return config.MIC_INDEX
 
+    try:
+        capable = _input_capable_indices()
+    except Exception as e:
+        print(f"⚠️ Could not query PyAudio input devices: {e}")
+        capable = None
+
+    def can_capture(idx: int) -> bool:
+        if capable is None:
+            return True
+        return idx in capable
+
     if config.MIC_NAME_HINT:
         hint = config.MIC_NAME_HINT.lower()
         for index, mic_name in enumerate(mic_names):
-            if hint in mic_name.lower():
-                print(f"✅ Using microphone {index}: {mic_name}")
-                return index
+            if not mic_name or hint not in mic_name.lower():
+                continue
+            if not can_capture(index):
+                continue
+            if _looks_like_bad_capture(mic_name):
+                continue
+            print(f"✅ Using microphone {index}: {mic_name}")
+            return index
 
     if 0 <= config.MIC_INDEX < len(mic_names):
+        name = mic_names[config.MIC_INDEX]
+        if can_capture(config.MIC_INDEX) and not _looks_like_bad_capture(name):
+            print(f"✅ Using configured microphone {config.MIC_INDEX}: {name}")
+            return config.MIC_INDEX
         print(
-            f"✅ Using configured microphone {config.MIC_INDEX}: "
-            f"{mic_names[config.MIC_INDEX]}"
+            f"⚠️ MIC_INDEX={config.MIC_INDEX} ({name}) is not a usable capture device "
+            "(e.g. HDMI output). Set MIC_INDEX or MIC_NAME_HINT to your analog/USB mic."
         )
-        return config.MIC_INDEX
 
-    print("⚠️ Requested microphone index not available. Falling back to default microphone.")
+    # Prefer any input-capable device that is not HDMI-only.
+    if capable:
+        for index in sorted(capable):
+            name = mic_names[index] if index < len(mic_names) else None
+            if _looks_like_bad_capture(name):
+                continue
+            print(f"✅ Using input device {index}: {name or 'unknown'}")
+            return index
+        # Last resort: any device that reports input channels (even HDMI) to avoid None.
+        index = min(capable)
+        name = mic_names[index] if index < len(mic_names) else None
+        print(f"✅ Using input device {index}: {name or 'unknown'}")
+
+        return index
+
+    print("⚠️ No PyAudio input device found. Using SpeechRecognition default microphone.")
     return None
 
 
 def init_microphone():
     global ACTIVE_MIC_INDEX
     ACTIVE_MIC_INDEX = resolve_microphone_index()
+
 
 def _ensure_vosk_model():
     global _VOSK_MODEL
@@ -127,14 +185,16 @@ def _vosk_listen_and_transcribe() -> str | None:
     import pyaudio
 
     pa = pyaudio.PyAudio()
-    stream = pa.open(
+    open_kw = dict(
         format=pyaudio.paInt16,
         channels=1,
         rate=config.MIC_SAMPLE_RATE,
         input=True,
-        input_device_index=ACTIVE_MIC_INDEX,
         frames_per_buffer=config.MIC_CHUNK_SIZE,
     )
+    if ACTIVE_MIC_INDEX is not None:
+        open_kw["input_device_index"] = ACTIVE_MIC_INDEX
+    stream = pa.open(**open_kw)
 
     rec = (
         KaldiRecognizer(model, config.MIC_SAMPLE_RATE, grammar)
@@ -219,11 +279,11 @@ def get_name():
                 else:
                     raise sr.UnknownValueError()
             elif config.STT_ENGINE == "google":
+                mic_kw = {"chunk_size": config.MIC_CHUNK_SIZE}
+                if ACTIVE_MIC_INDEX is not None:
+                    mic_kw["device_index"] = ACTIVE_MIC_INDEX
                 with audio_probe_context():
-                    with sr.Microphone(
-                        device_index=ACTIVE_MIC_INDEX,
-                        chunk_size=config.MIC_CHUNK_SIZE,
-                    ) as source:
+                    with sr.Microphone(**mic_kw) as source:
                         # Keep this small to reduce start-up latency.
                         if config.MIC_AMBIENT_DURATION > 0:
                             r.adjust_for_ambient_noise(source, duration=config.MIC_AMBIENT_DURATION)

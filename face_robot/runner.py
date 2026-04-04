@@ -45,16 +45,19 @@ def run():
     # Cache to avoid recomputing encodings for stable faces.
     # Each entry: {"box": (t,r,b,l), "name": str, "ts": float}
     track_cache = []
+    _TRACK_CACHE_MAX = 48
 
     try:
         while True:
-            ret, frame = video.read()
-            if not ret:
-                continue
-
-            frame_count += 1
-
             try:
+                ret, frame = video.read()
+                if not ret:
+                    # Avoid busy-spinning when the device stalls or returns no frame.
+                    time.sleep(0.02)
+                    continue
+
+                frame_count += 1
+
                 if frame_count % config.PROCESS_EVERY_N_FRAMES != 0:
                     continue
 
@@ -73,6 +76,9 @@ def run():
                     track_cache = [e for e in track_cache if e["ts"] >= cutoff]
                 else:
                     track_cache = []
+                if len(track_cache) > _TRACK_CACHE_MAX:
+                    track_cache.sort(key=lambda e: e["ts"])
+                    track_cache = track_cache[-_TRACK_CACHE_MAX:]
 
                 # Determine which faces can be labeled from cache.
                 names = ["Unknown"] * len(valid_faces)
@@ -184,8 +190,10 @@ def run():
                             for _ in range(config.ENROLLMENT_SAMPLES):
                                 ret, frame = video.read()
                                 if not ret:
+                                    time.sleep(0.05)
                                     continue
                                 if not vision.is_sharp_enough(frame):
+                                    time.sleep(0.05)
                                     continue
 
                                 rgb_i, faces = vision.detect_faces(frame)
@@ -227,10 +235,7 @@ def run():
                                 unknown_count = 0
 
             except KeyboardInterrupt:
-                # Allow Ctrl+C to stop without a traceback; cleanup happens in finally.
                 return
-            except Exception:
-                raise
 
     finally:
         video.release()

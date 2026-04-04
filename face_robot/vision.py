@@ -117,16 +117,26 @@ def pick_primary_face(encodings, face_locations):
 
 
 def match_known_user(encoding, known_profiles, known_samples):
+    """
+    Compare one face encoding to known users. Uses the same L2 distance as
+    face_recognition.face_distance, batched with NumPy for lower overhead.
+    """
     if not known_profiles:
         return "Unknown"
 
+    enc = np.asarray(encoding, dtype=np.float64).ravel()
+    tol_ext = config.TOLERANCE + 0.03
     best_name = "Unknown"
     best_score = None
 
     for candidate_name, profile_encoding in known_profiles.items():
-        profile_distance = face_recognition.face_distance([profile_encoding], encoding)[0]
-        sample_distances = face_recognition.face_distance(known_samples[candidate_name], encoding)
-        support_matches = int(np.sum(sample_distances < (config.TOLERANCE + 0.03)))
+        prof = np.asarray(profile_encoding, dtype=np.float64).ravel()
+        profile_distance = float(np.linalg.norm(prof - enc))
+        samples_arr = np.asarray(known_samples[candidate_name], dtype=np.float64)
+        if samples_arr.ndim == 1:
+            samples_arr = samples_arr.reshape(1, -1)
+        sample_distances = np.linalg.norm(samples_arr - enc, axis=1)
+        support_matches = int(np.sum(sample_distances < tol_ext))
         score = profile_distance - (0.015 * min(support_matches, 3))
 
         if best_score is None or score < best_score:
